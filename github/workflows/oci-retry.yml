@@ -1,0 +1,73 @@
+name: OCI ARM Retry
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install OCI CLI
+        run: pip install oci-cli --quiet
+
+      - name: Configure OCI
+        run: |
+          mkdir -p ~/.oci
+          echo "${{ secrets.OCI_PRIVATE_KEY }}" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config << EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=~/.oci/key.pem
+          EOF
+
+      - name: Try create ARM instance
+        run: |
+          SSH_KEY="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC+E9mC9r54VToWF3fQnEy3TNLGmeOud8jf4hHQNHVmzaZOVk7dnYWkul1jqlfojpk3TnFIKS0E0adoMtPly/5ErKeIC4tjAa3+tgmPgsAcSfmHdiN09Hm3pAIfBBz9Vy0NKmnYBkV26kQWSTr3505kF125qbGglBFCxQGobs3yosDGpfhzsAqnrCXGJdxb0k8ZNJghacBVhc4nYh5HmFaGpsTc01bLOgw7rAolu1siQsn12TOJiRmgyGD/9M7e71khFdMthrBxpNeicx/KXaGJoCag87wau02YCxRivkUB+0B2BmgvIW7TbN2nvwzIQMtQAxnNgYsY1jwbr8rb5kZP ssh-key-2026-04-19"
+          echo "$SSH_KEY" > /tmp/ssh.pub
+          echo '{"ocpus":1,"memoryInGBs":6}' > /tmp/shape.json
+
+          TENANCY="${{ secrets.OCI_TENANCY }}"
+          SUBNET="ocid1.subnet.oc1.iad.aaaaaaaalsr5pklbbryjghojefc3w6d3vvztfufr6ial7weqqhn45vp4z4tq"
+          IMAGE="ocid1.image.oc1.iad.aaaaaaaaccnswiekwi4w3pkmygjvfk24epduwj7uvq2smjmznu4kq6dcs27a"
+          TOPIC="ocid1.onstopic.oc1.iad.amaaaaaahylac4iamae6dsm4n46ehtop46fdscqvtgxmfxu7iv4i4fna5x2q"
+          ADS=("Vyuk:US-ASHBURN-AD-1" "Vyuk:US-ASHBURN-AD-2" "Vyuk:US-ASHBURN-AD-3")
+
+          for AD in "${ADS[@]}"; do
+            echo "Tentando $AD..."
+            RESULT=$(oci compute instance launch \
+              --compartment-id "$TENANCY" \
+              --availability-domain "$AD" \
+              --display-name "Agente-Claude-ARM" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config file:///tmp/shape.json \
+              --image-id "$IMAGE" \
+              --subnet-id "$SUBNET" \
+              --assign-public-ip true \
+              --boot-volume-size-in-gbs 200 \
+              --ssh-authorized-keys-file /tmp/ssh.pub 2>&1)
+
+            if echo "$RESULT" | grep -q '"id"'; then
+              echo "SUCESSO em $AD!"
+              INSTANCE_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")
+              echo '{"ocpus":4,"memoryInGBs":24}' > /tmp/upg.json
+              oci compute instance update --instance-id "$INSTANCE_ID" --shape-config file:///tmp/upg.json --force
+              sleep 30
+              VNIC_ID=$(oci compute vnic-attachment list --instance-id "$INSTANCE_ID" | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['vnic-id'])")
+              IP=$(oci network vnic get --vnic-id "$VNIC_ID" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['public-ip'])")
+              echo "IP: $IP"
+              oci ons message publish \
+                --topic-id "$TOPIC" \
+                --title "SHAZAM! Instancia criada" \
+                --body "Criada em $AD | IP: $IP | SSH: ssh -i ssh-key-2026-04-19.key ubuntu@$IP"
+              exit 0
+            else
+              echo "Sem capacidade em $AD"
+            fi
+          done
+          echo "Nenhuma capacidade disponível nesta rodada."
